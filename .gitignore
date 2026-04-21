@@ -1,0 +1,4 @@
+*.o
+*.a
+biceps
+.DS_Store
