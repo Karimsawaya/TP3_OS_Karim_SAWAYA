@@ -24,7 +24,6 @@ typedef struct Contact {
     struct Contact *next;
 } Contact;
 
-/* Etat global du service BEUIP (threads, sockets et contacts). */
 static pthread_t udp_thread;
 static pthread_t tcp_thread;
 static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -76,7 +75,6 @@ static int filename_is_safe(const char *name)
 
 static void free_contact_list(void)
 {
-    /* Vide toute la liste des contacts (arret propre). */
     Contact *cur;
     pthread_mutex_lock(&list_mutex);
     cur = contacts;
@@ -91,7 +89,6 @@ static void free_contact_list(void)
 
 static void add_contact_locked(const char *pseudo, const char *ip)
 {
-    /* Insertion/maj triee par pseudo (mutex deja pris). */
     Contact *cur = contacts;
     Contact *prev = NULL;
     Contact *node;
@@ -166,7 +163,7 @@ static void print_contacts(void)
     cur = contacts;
     while (cur != NULL) {
         if (!is_localhost_ip(cur->ip)) {
-            printf("%-15s %s\n", cur->ip, cur->pseudo);
+            printf("%s : %s\n", cur->ip, cur->pseudo);
         }
         cur = cur->next;
     }
@@ -215,7 +212,6 @@ static int find_pseudo_for_ip(const char *ip, char *out_pseudo, size_t out_sz)
 
 static int send_udp_packet(const char *ip, char code, const char *payload)
 {
-    /* Format paquet: <code><magic><payload>. */
     struct sockaddr_in dst;
     char packet[BEUIP_MAX_MSG];
     int len;
@@ -251,10 +247,12 @@ static int send_udp_packet(const char *ip, char code, const char *payload)
 
 static void broadcast_identification(void)
 {
-    /* Diffuse l'identification sur chaque interface IPv4 broadcast. */
     struct ifaddrs *ifaddr = NULL;
     struct ifaddrs *ifa;
     char host[NI_MAXHOST];
+
+    /* Adresse fixe du reseau du TP - toujours envoyee en premier */
+    send_udp_packet(BEUIP_BROADCAST, '1', local_pseudo);
 
     if (getifaddrs(&ifaddr) == -1) {
         perror("getifaddrs");
@@ -262,78 +260,70 @@ static void broadcast_identification(void)
     }
 
     for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
-        if (ifa->ifa_addr == NULL || ifa->ifa_broadaddr == NULL) {
+        if (ifa->ifa_addr == NULL || ifa->ifa_broadaddr == NULL)
             continue;
-        }
-        if (ifa->ifa_addr->sa_family != AF_INET) {
+        if (ifa->ifa_addr->sa_family != AF_INET)
             continue;
-        }
         if (getnameinfo(ifa->ifa_broadaddr, sizeof(struct sockaddr_in),
-                        host, sizeof(host), NULL, 0, NI_NUMERICHOST) != 0) {
+                        host, sizeof(host), NULL, 0, NI_NUMERICHOST) != 0)
             continue;
-        }
-        if (strcmp(host, "127.0.0.1") == 0 || strcmp(host, "0.0.0.0") == 0) {
+        if (strcmp(host, "127.0.0.1") == 0 || strcmp(host, "0.0.0.0") == 0)
             continue;
-        }
-#ifdef TRACE
-        fprintf(stderr, "[TRACE] broadcast sur %s\n", host);
-#endif
+        if (strcmp(host, BEUIP_BROADCAST) == 0)
+            continue;
+        tracef("[TRACE] broadcast sur %s\n", host);
         send_udp_packet(host, '1', local_pseudo);
     }
 
     freeifaddrs(ifaddr);
 }
 
+
+static void send_depart_to_all(void)
+{
+    Contact *cur = contacts;
+    while (cur != NULL) {
+        if (!is_localhost_ip(cur->ip))
+            send_udp_packet(cur->ip, '0', local_pseudo);
+        cur = cur->next;
+    }
+}
+
+static void send_message_to_user(const char *pseudo, const char *message)
+{
+    Contact *cur = contacts;
+    while (cur != NULL) {
+        if (strcmp(cur->pseudo, pseudo) == 0) {
+            send_udp_packet(cur->ip, '4', message);
+            return;
+        }
+        cur = cur->next;
+    }
+    fprintf(stderr, "beuip: pseudo '%s' introuvable\n", pseudo);
+}
+
+static void send_message_to_all(const char *message)
+{
+    Contact *cur = contacts;
+    while (cur != NULL) {
+        if (!is_localhost_ip(cur->ip))
+            send_udp_packet(cur->ip, '5', message);
+        cur = cur->next;
+    }
+}
+
 static void local_command(char code, const char *message, const char *pseudo)
 {
-    /* Actions locales transformees en envois reseau UDP. */
-    Contact *cur;
-    char payload[BEUIP_MAX_MSG];
-
-    if (udp_sock < 0) {
+    if (udp_sock < 0)
         return;
-    }
 
     pthread_mutex_lock(&list_mutex);
-
-    if (code == '0') {
-        cur = contacts;
-        while (cur != NULL) {
-            if (!is_localhost_ip(cur->ip)) {
-                send_udp_packet(cur->ip, '0', local_pseudo);
-            }
-            cur = cur->next;
-        }
-        pthread_mutex_unlock(&list_mutex);
-        return;
-    }
-
-    if (code == '4') {
-        cur = contacts;
-        while (cur != NULL) {
-            if (strcmp(cur->pseudo, pseudo) == 0) {
-                send_udp_packet(cur->ip, '9', message);
-                pthread_mutex_unlock(&list_mutex);
-                return;
-            }
-            cur = cur->next;
-        }
-        pthread_mutex_unlock(&list_mutex);
-        fprintf(stderr, "mess: pseudo '%s' introuvable\n", pseudo);
-        return;
-    }
-
-    if (code == '5') {
-        snprintf(payload, sizeof(payload), "%s", message != NULL ? message : "");
-        cur = contacts;
-        while (cur != NULL) {
-            if (!is_localhost_ip(cur->ip)) {
-                send_udp_packet(cur->ip, '9', payload);
-            }
-            cur = cur->next;
-        }
-    }
-
+    if (code == '0')
+        send_depart_to_all();
+    else if (code == '4')
+        send_message_to_user(pseudo, message);
+    else if (code == '5')
+        send_message_to_all(message != NULL ? message : "");
     pthread_mutex_unlock(&list_mutex);
 }
 
@@ -374,7 +364,6 @@ static void wake_tcp_thread(void)
 
 static int ensure_share_dir(void)
 {
-    /* Verifie/cree le repertoire de partage local. */
     struct stat st;
 
     if (stat(share_dir, &st) == 0) {
@@ -394,7 +383,6 @@ static int ensure_share_dir(void)
 
 static void send_file_list(int fd)
 {
-    /* Repond au client TCP avec "ls -l" du repertoire partage. */
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
@@ -413,7 +401,6 @@ static void send_file_list(int fd)
 
 static void send_named_file(int fd, const char *name)
 {
-    /* Repond au client TCP avec le contenu d'un fichier demande. */
     char path[512];
     pid_t pid;
 
@@ -446,7 +433,6 @@ static void send_named_file(int fd, const char *name)
 
 static void serve_tcp_client(int fd)
 {
-    /* Protocole TCP minimal: 'L' (liste) ou 'F<nom>\\n' (fichier). */
     char first;
 
     if (read(fd, &first, 1) != 1) {
@@ -479,7 +465,6 @@ static void serve_tcp_client(int fd)
 
 static void *udp_server_main(void *arg)
 {
-    /* Boucle serveur UDP: presence, decouverte et messages texte. */
     const char *pseudo = (const char *)arg;
     struct sockaddr_in addr;
     int yes = 1;
@@ -545,7 +530,8 @@ static void *udp_server_main(void *arg)
         case '2':
             add_contact(buf + 6, sender_ip);
             break;
-        case '9':
+        case '4':
+        case '5':
             if (find_pseudo_for_ip(sender_ip, sender_name, sizeof(sender_name))) {
                 printf("\nMessage de %s : %s\n", sender_name, buf + 6);
             } else {
@@ -568,7 +554,6 @@ static void *udp_server_main(void *arg)
 
 static void *tcp_server_main(void *arg)
 {
-    /* Boucle serveur TCP pour ls/get sur le repertoire partage. */
     const char *rep = (const char *)arg;
     struct sockaddr_in addr;
     int yes = 1;
@@ -632,7 +617,6 @@ int beuip_is_running(void)
 
 int beuip_start(const char *pseudo)
 {
-    /* Demarre les threads UDP/TCP et publie le pseudo local. */
     if (pseudo == NULL || *pseudo == '\0') {
         fprintf(stderr, "beuip: pseudo manquant\n");
         return 1;
@@ -680,7 +664,6 @@ int beuip_start(const char *pseudo)
 
 int beuip_stop(void)
 {
-    /* Arret ordonne: annonce depart, reveille les threads, join. */
     pthread_mutex_lock(&state_mutex);
     if (!server_running) {
         pthread_mutex_unlock(&state_mutex);
@@ -741,7 +724,6 @@ int beuip_message_all(const char *message)
 
 int beuip_ls(const char *pseudo)
 {
-    /* Ouvre une session TCP distante et demande la liste des fichiers. */
     int s;
     struct sockaddr_in dst;
     char ip[16];
@@ -790,7 +772,6 @@ int beuip_ls(const char *pseudo)
 
 int beuip_get(const char *pseudo, const char *nomfic)
 {
-    /* Recupere un fichier distant et l'enregistre en local. */
     int s;
     int fd;
     struct sockaddr_in dst;

@@ -1,4 +1,6 @@
 *.o
 *.a
 biceps
+biceps-memory-leaks
 .DS_Store
+reppub/
